@@ -334,6 +334,16 @@ def render_stats_diff(old_d: dict, new_d: dict) -> str:
     return "\n\n".join(diffs)
 
 def handle_message(peer_id, user_id, text, payload, attachments):
+    # Команда запроса ID беседы доступна каждому пользователю
+    if text.strip().lower() in ["/chat_id", "айди чата"]:
+        vk.messages.send(
+            peer_id=peer_id,
+            message=f"🆔 ID этого чата (peer_id): {peer_id}",
+            random_id=get_random_id()
+        )
+        return
+
+    # Ограничение по ID для выполнения любых других действий
     if user_id not in ALLOWED_USERS:
         return
 
