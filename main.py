@@ -4,11 +4,10 @@ import json
 import re
 import asyncio
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 
 import aiohttp
-from bs4 import BeautifulSoup
 
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
@@ -19,9 +18,8 @@ from vk_api.utils import get_random_id
 # -------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 
-# Токен берется из переменной окружения хостинга (или передается аргументом)
 VK_TOKEN = os.getenv("VK_TOKEN") or os.getenv("BOT_TOKEN")
-GROUP_ID = os.getenv("GROUP_ID")  # ID группы ВК (число)
+GROUP_ID = os.getenv("GROUP_ID")
 
 if not VK_TOKEN or not GROUP_ID:
     print("❌ Ошибка: Не заданы переменные окружения VK_TOKEN или GROUP_ID!")
@@ -53,7 +51,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Таблица персонажей
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS characters (
         char_id INTEGER PRIMARY KEY,
@@ -64,7 +61,6 @@ def init_db():
     )
     """)
     
-    # Таблица логов изменений (по дням/интервалам)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS stats_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +71,6 @@ def init_db():
     )
     """)
     
-    # Таблица артов
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS photos (
         photo_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +80,6 @@ def init_db():
     )
     """)
     
-    # Таблица состояния ожидания ввода пользователей
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS user_states (
         user_id INTEGER PRIMARY KEY,
@@ -100,7 +94,7 @@ def init_db():
 init_db()
 
 # -------------------------------------------------------------------
-# 3. ПАРСИНГ СТАЦИОНАРНЫХ СТРАНИЦ
+# 3. ПАРСИНГ СТРАНИЦ (БЕЗ BS4)
 # -------------------------------------------------------------------
 def parse_num_val(val: str) -> float:
     if not val:
@@ -135,21 +129,18 @@ async def fetch_character_data(char_id: int) -> dict | None:
         except Exception:
             return None
 
-    soup = BeautifulSoup(html, "html.parser")
-    text_content = soup.get_text()
+    # Очистка HTML от тегов
+    text_content = re.sub(r'<[^>]+>', ' ', html)
 
-    # Извлечение имени и аккаунта
     name = f"Персонаж {char_id}"
     account = "Неизвестно"
     
-    # Поиск запаха
     smell = "Неизвестно"
-    smell_span = soup.find("span", style=re.compile(r"background(?:-color)?|color", re.I))
-    if smell_span:
-        style_attr = smell_span.get("style", "").lower()
-        hex_match = re.search(r"#[0-9a-f]{6}\b", style_attr)
-        if hex_match and hex_match.group(0) in SMELL_MAP:
-            smell = SMELL_MAP[hex_match.group(0)]
+    hex_matches = re.findall(r'#[0-9a-fA-F]{6}\b', html)
+    for hex_code in hex_matches:
+        if hex_code.lower() in SMELL_MAP:
+            smell = SMELL_MAP[hex_code.lower()]
+            break
 
     def extract_val(label_patterns):
         for pattern in label_patterns:
@@ -158,18 +149,17 @@ async def fetch_character_data(char_id: int) -> dict | None:
                 return parse_num_val(match.group(1))
         return 0.0
 
-    # Извлечение строковых полей (Имя, Должность, Аккаунт)
-    name_match = re.search(r"Имя:\s*([^\n]+)", text_content)
+    name_match = re.search(r"Имя:\s*([^\n<]+)", text_content)
     if name_match: name = name_match.group(1).strip()
     
     role = "Неизвестно"
-    role_match = re.search(r"Должность:\s*([^\n]+)", text_content)
+    role_match = re.search(r"Должность:\s*([^\n<]+)", text_content)
     if role_match: role = role_match.group(1).strip()
 
-    acc_match = re.search(r"Аккаунт:\s*([^\n]+)", text_content)
+    acc_match = re.search(r"Аккаунт:\s*([^\n<]+)", text_content)
     if acc_match: account = acc_match.group(1).strip()
 
-    hours_match = re.search(r"(?:проведено в игре|время в игре)[^<]*?:\s*([^\n]+)", text_content, re.I)
+    hours_match = re.search(r"(?:проведено в игре|время в игре)[^<]*?:\s*([^\n<]+)", text_content, re.I)
     game_hours = parse_game_hours(hours_match.group(1)) if hours_match else 0.0
 
     return {
@@ -206,7 +196,6 @@ vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 
 def create_keyboard(buttons_matrix):
-    """Формирует JSON-клавиатуру ВК"""
     return json.dumps({
         "one_time": False,
         "buttons": buttons_matrix
@@ -242,7 +231,7 @@ def get_character_menu_text(data: dict) -> str:
         f"• Выброшено предметов: {data['items_dropped']}"
     )
 
-def send_char_card(user_id, char_id):
+def send_char_card(peer_id, char_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT last_parsed_data FROM characters WHERE char_id = ?", (char_id,))
@@ -250,7 +239,7 @@ def send_char_card(user_id, char_id):
     conn.close()
 
     if not row or not row[0]:
-        vk.messages.send(user_id=user_id, message="⚠️ Данные персонажа ещё не загружены.", random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message="⚠️ Данные персонажа ещё не загружены.", random_id=get_random_id())
         return
 
     data = json.loads(row[0])
@@ -265,7 +254,7 @@ def send_char_card(user_id, char_id):
         [{"action": {"type": "text", "payload": json.dumps({"cmd": "all_chars", "page": 1}), "label": "◀️ К списку"}, "color": "negative"}]
     ])
 
-    vk.messages.send(user_id=user_id, message=text, keyboard=kb, random_id=get_random_id())
+    vk.messages.send(peer_id=peer_id, message=text, keyboard=kb, random_id=get_random_id())
 
 # -------------------------------------------------------------------
 # 5. ФОНОВЫЙ ПАРСИНГ КАЖДЫЕ 5 МИНУТ
@@ -289,7 +278,6 @@ async def update_character_in_db(char_id: int):
     conn.close()
 
 async def background_scheduler():
-    """Фоновый парсер раз в 5 минут"""
     while True:
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -300,27 +288,25 @@ async def background_scheduler():
 
             for cid in char_ids:
                 await update_character_in_db(cid)
-                await asyncio.sleep(1) # Небольшая пауза между запросами
+                await asyncio.sleep(1)
 
         except Exception as e:
             logging.error(f"Ошибка в фоновом планировщике: {e}")
 
-        await asyncio.sleep(300) # 5 минут
+        await asyncio.sleep(300)
 
 # -------------------------------------------------------------------
-# 6. ОБРАБОТКА КОМАНД И КНОПОК
+# 6. ОБРАБОТКА СООБЩЕНИЙ ЧАТА
 # -------------------------------------------------------------------
 def render_stats_diff(old_d: dict, new_d: dict) -> str:
     diffs = []
     
-    # Сравнение основной информации
     main_diffs = []
     if old_d.get("age") != new_d.get("age"):
         main_diffs.append(f"Возраст: {old_d.get('age')} > {new_d.get('age')}")
     if old_d.get("role") != new_d.get("role"):
         main_diffs.append(f"Должность: {old_d.get('role')} -> {new_d.get('role')}")
 
-    # Сравнение навыков
     skills_map = {
         "combat_skills": "боевые умения",
         "item_search": "поиск предметов",
@@ -347,25 +333,24 @@ def render_stats_diff(old_d: dict, new_d: dict) -> str:
 
     return "\n\n".join(diffs)
 
-def handle_message(user_id, text, payload, attachments):
+def handle_message(peer_id, user_id, text, payload, attachments):
     if user_id not in ALLOWED_USERS:
         return
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Проверка текстовых состояний (редактирование текста)
     cursor.execute("SELECT state, char_id FROM user_states WHERE user_id = ?", (user_id,))
     user_state = cursor.fetchone()
 
     if user_state:
         state, char_id = user_state
-        if text.strip() == "Отменить":
+        if text.strip().lower() == "отменить":
             cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
             conn.commit()
             conn.close()
-            vk.messages.send(user_id=user_id, message="❌ Действие отменено.", random_id=get_random_id())
-            send_char_card(user_id, char_id)
+            vk.messages.send(peer_id=peer_id, message="❌ Действие отменено.", random_id=get_random_id())
+            send_char_card(peer_id, char_id)
             return
 
         if state == "ADD_PHOTOS":
@@ -386,8 +371,8 @@ def handle_message(user_id, text, payload, attachments):
                 cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
                 conn.commit()
                 conn.close()
-                vk.messages.send(user_id=user_id, message=f"✅ Успешно добавлено фото: {len(photo_atts)} шт.", random_id=get_random_id())
-                send_char_card(user_id, char_id)
+                vk.messages.send(peer_id=peer_id, message=f"✅ Успешно добавлено фото: {len(photo_atts)} шт.", random_id=get_random_id())
+                send_char_card(peer_id, char_id)
                 return
 
         elif state == "EDIT_CHAR":
@@ -395,8 +380,8 @@ def handle_message(user_id, text, payload, attachments):
             cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
             conn.commit()
             conn.close()
-            vk.messages.send(user_id=user_id, message="✅ Характер обновлён!", random_id=get_random_id())
-            send_char_card(user_id, char_id)
+            vk.messages.send(peer_id=peer_id, message="✅ Характер обновлён!", random_id=get_random_id())
+            send_char_card(peer_id, char_id)
             return
 
         elif state == "EDIT_BIO":
@@ -404,11 +389,10 @@ def handle_message(user_id, text, payload, attachments):
             cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
             conn.commit()
             conn.close()
-            vk.messages.send(user_id=user_id, message="✅ Биография обновлена!", random_id=get_random_id())
-            send_char_card(user_id, char_id)
+            vk.messages.send(peer_id=peer_id, message="✅ Биография обновлена!", random_id=get_random_id())
+            send_char_card(peer_id, char_id)
             return
 
-    # Обработка текстовых команд добавления/удаления
     if text.startswith("/add "):
         try:
             cid = int(text.split()[1])
@@ -416,10 +400,10 @@ def handle_message(user_id, text, payload, attachments):
             conn.commit()
             conn.close()
             asyncio.run_coroutine_threadsafe(update_character_in_db(cid), asyncio.get_event_loop())
-            vk.messages.send(user_id=user_id, message=f"✅ Персонаж ID {cid} добавлен!", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message=f"✅ Персонаж ID {cid} добавлен!", random_id=get_random_id())
             return
         except Exception:
-            vk.messages.send(user_id=user_id, message="❌ Ошибка. Формат: /add {id}", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message="❌ Ошибка. Формат: /add {id}", random_id=get_random_id())
             conn.close()
             return
 
@@ -429,14 +413,13 @@ def handle_message(user_id, text, payload, attachments):
             cursor.execute("DELETE FROM photos WHERE photo_id = ?", (pid,))
             conn.commit()
             conn.close()
-            vk.messages.send(user_id=user_id, message=f"🗑 Фото ID {pid} удалено!", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message=f"🗑 Фото ID {pid} удалено!", random_id=get_random_id())
             return
         except Exception:
-            vk.messages.send(user_id=user_id, message="❌ Ошибка. Формат: /dell photo {id}", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message="❌ Ошибка. Формат: /dell photo {id}", random_id=get_random_id())
             conn.close()
             return
 
-    # Обработка нажатий Inline-кнопок (Payload) или /all
     cmd = payload.get("cmd") if payload else None
     
     if text.lower() in ["/all", "все персонажи"] or cmd == "all_chars":
@@ -446,7 +429,7 @@ def handle_message(user_id, text, payload, attachments):
         conn.close()
 
         if not chars:
-            vk.messages.send(user_id=user_id, message="Список персонажей пуст. Добавьте через `/add {id}`", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message="Список персонажей пуст. Добавьте через `/add {id}`", random_id=get_random_id())
             return
 
         per_page = 5
@@ -468,20 +451,19 @@ def handle_message(user_id, text, payload, attachments):
         if nav_row:
             kb_matrix.append(nav_row)
 
-        vk.messages.send(user_id=user_id, message=f"📜 Список персонажей (Стр. {page}/{total_pages}):", keyboard=create_keyboard(kb_matrix), random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message=f"📜 Список персонажей (Стр. {page}/{total_pages}):", keyboard=create_keyboard(kb_matrix), random_id=get_random_id())
         return
 
     if cmd == "open_char":
         conn.close()
-        send_char_card(user_id, payload["id"])
+        send_char_card(peer_id, payload["id"])
         return
 
     if cmd == "refresh":
         conn.close()
         cid = payload["id"]
-        vk.messages.send(user_id=user_id, message="⏳ Парсим данные с сайта...", random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message="⏳ Парсим данные с сайта...", random_id=get_random_id())
         
-        # Обновляем в фоне вне потока кулдаунов
         loop = asyncio.get_event_loop()
         future = asyncio.run_coroutine_threadsafe(fetch_character_data(cid), loop)
         data = future.result()
@@ -493,10 +475,10 @@ def handle_message(user_id, text, payload, attachments):
                         (data["name"], json.dumps(data, ensure_ascii=False), cid))
             c.commit()
             c.close()
-            vk.messages.send(user_id=user_id, message="✅ Данные обновлены!", random_id=get_random_id())
-            send_char_card(user_id, cid)
+            vk.messages.send(peer_id=peer_id, message="✅ Данные обновлены!", random_id=get_random_id())
+            send_char_card(peer_id, cid)
         else:
-            vk.messages.send(user_id=user_id, message="❌ Ошибка загрузки данных с сайта.", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message="❌ Ошибка загрузки данных с сайта.", random_id=get_random_id())
         return
 
     if cmd == "arts":
@@ -510,16 +492,15 @@ def handle_message(user_id, text, payload, attachments):
             conn.close()
 
             kb = create_keyboard([[{"action": {"type": "text", "label": "Отменить"}, "color": "negative"}]])
-            vk.messages.send(user_id=user_id, message="🖼 Артов нет. Отправьте до 10 фото или нажмите 'Отменить':", keyboard=kb, random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message="🖼 Артов нет. Отправьте до 10 фото в чат или нажмите 'Отменить':", keyboard=kb, random_id=get_random_id())
             return
 
         conn.close()
-        # Группировка по 10 фото в сообщении
         for i in range(0, len(photos), 10):
             chunk = photos[i:i+10]
             atts = [p[1] for p in chunk]
             ids_str = ", ".join([f"ID:{p[0]}" for p in chunk])
-            vk.messages.send(user_id=user_id, message=f"🖼 Арты ({ids_str}):", attachment=",".join(atts), random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message=f"🖼 Арты ({ids_str}):", attachment=",".join(atts), random_id=get_random_id())
 
         c = sqlite3.connect(DB_PATH)
         cur = c.cursor()
@@ -528,7 +509,7 @@ def handle_message(user_id, text, payload, attachments):
         c.close()
 
         kb = create_keyboard([[{"action": {"type": "text", "label": "Отменить"}, "color": "negative"}]])
-        vk.messages.send(user_id=user_id, message="➕ Отправьте фото (до 10 шт.) для добавления или нажмите 'Отменить':", keyboard=kb, random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message="➕ Отправьте фото (до 10 шт.) для добавления или нажмите 'Отменить':", keyboard=kb, random_id=get_random_id())
         return
 
     if cmd in ["char_text", "bio"]:
@@ -541,8 +522,6 @@ def handle_message(user_id, text, payload, attachments):
         row = cursor.fetchone()
         curr_val = row[0] if row else None
 
-        kb_btn_label = "Редактировать" if curr_val else "Добавить"
-        
         cursor.execute("REPLACE INTO user_states (user_id, state, char_id) VALUES (?, ?, ?)", (user_id, state_name, cid))
         conn.commit()
         conn.close()
@@ -551,8 +530,8 @@ def handle_message(user_id, text, payload, attachments):
             [{"action": {"type": "text", "label": "Отменить"}, "color": "negative"}]
         ])
 
-        msg = f"📜 **{label_name}**:\n\n{curr_val or 'Не заполнено'}\n\nЧтобы изменить, отправьте новый текст соо:"
-        vk.messages.send(user_id=user_id, message=msg, keyboard=kb, random_id=get_random_id())
+        msg = f"📜 **{label_name}**:\n\n{curr_val or 'Не заполнено'}\n\nЧтобы изменить, отправьте новый текст в чат:"
+        vk.messages.send(peer_id=peer_id, message=msg, keyboard=kb, random_id=get_random_id())
         return
 
     if cmd == "stats_days":
@@ -564,7 +543,7 @@ def handle_message(user_id, text, payload, attachments):
         conn.close()
 
         if len(history) < 2:
-            vk.messages.send(user_id=user_id, message="📊 Недостаточно данных для формирования изменений.", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message="📊 Недостаточно данных для формирования изменений.", random_id=get_random_id())
             return
 
         diffs_list = []
@@ -576,7 +555,7 @@ def handle_message(user_id, text, payload, attachments):
                 diffs_list.append(f"📅 [{t_new}]\n{diff_text}")
 
         if not diffs_list:
-            vk.messages.send(user_id=user_id, message="📊 Прокачек/изменений за последнее время не зафиксировано.", random_id=get_random_id())
+            vk.messages.send(peer_id=peer_id, message="📊 Прокачек/изменений за последнее время не зафиксировано.", random_id=get_random_id())
             return
 
         per_page = 5
@@ -594,22 +573,28 @@ def handle_message(user_id, text, payload, attachments):
 
         kb = create_keyboard([nav_row, [{"action": {"type": "text", "payload": json.dumps({"cmd": "open_char", "id": cid}), "label": "◀️ Назад к карточке"}, "color": "negative"}]]) if nav_row else create_keyboard([[{"action": {"type": "text", "payload": json.dumps({"cmd": "open_char", "id": cid}), "label": "◀️ Назад к карточке"}, "color": "negative"}]])
 
-        vk.messages.send(user_id=user_id, message=response_text, keyboard=kb, random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message=response_text, keyboard=kb, random_id=get_random_id())
         return
 
     conn.close()
 
 # -------------------------------------------------------------------
-# 7. ЗАПУСК БОТА И ЦИКЛА LONGPOLL
+# 7. ЗАПУСК БОТА
 # -------------------------------------------------------------------
 def start_vk_bot():
     longpoll = VkBotLongPoll(vk_session, GROUP_ID)
-    print("🚀 ВК-бот успешно запущен!")
+    print("🚀 ВК-бот запущен и ожидает сообщений из беседы...")
 
     for event in longpoll.listen():
         if event.type == VkBotEventType.MESSAGE_NEW:
             msg = event.object.message
+            peer_id = msg.get("peer_id")
             user_id = msg.get("from_id")
+            
+            # Реакция только на беседы
+            if peer_id <= 2000000000:
+                continue
+
             text = msg.get("text", "")
             attachments = msg.get("attachments", [])
             
@@ -620,12 +605,10 @@ def start_vk_bot():
                 except Exception:
                     pass
 
-            handle_message(user_id, text, payload, attachments)
+            handle_message(peer_id, user_id, text, payload, attachments)
 
 async def main():
-    # Запускаем фоновый парсинг 5-минуток в событиной петле
     asyncio.create_task(background_scheduler())
-    # Слушатель ВК LongPoll в отдельном потоке
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, start_vk_bot)
 
