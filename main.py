@@ -19,10 +19,9 @@ from vk_api.utils import get_random_id
 logging.basicConfig(level=logging.INFO)
 
 VK_TOKEN = os.getenv("VK_TOKEN") or os.getenv("BOT_TOKEN")
-GROUP_ID = os.getenv("GROUP_ID")
 
 if not VK_TOKEN or not GROUP_ID:
-    print("❌ Ошибка: Не заданы переменные окружения VK_TOKEN или GROUP_ID!")
+    print("❌ Ошибка: Не заданы переменные окружения VK_TOKEN!")
     sys.exit(1)
 
 ALLOWED_USERS = {854927157, 1087120613}
